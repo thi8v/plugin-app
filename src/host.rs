@@ -1,5 +1,5 @@
 use std::{
-    fmt::Display,
+    fmt::{Debug, Display},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -26,17 +26,11 @@ impl Display for Level {
     }
 }
 
-struct PluginState {
-    shell: Arc<Mutex<Shell>>,
-}
+struct PluginState;
 
 impl plugin_app::core::host_app::Host for PluginState {
     fn log(&mut self, lvl: Level, msg: String) -> () {
         println!("{lvl}: {msg}")
-    }
-
-    fn define_cmd(&mut self, name: String, usage: String, description: String) {
-        println!("NAME = {name:?}; USAGE = {usage:?}, DESCRIPTION = {description:?}")
     }
 }
 
@@ -51,21 +45,21 @@ pub struct PluginHost {
     bindings: Core,
 }
 
+impl Debug for PluginHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginHost").finish_non_exhaustive()
+    }
+}
+
 impl PluginHost {
-    pub fn try_new(
-        engine: Engine,
-        shell: Arc<Mutex<Shell>>,
-        path: impl AsRef<Path>,
-    ) -> Result<PluginHost> {
+    pub fn try_new(engine: Engine, path: impl AsRef<Path>) -> Result<PluginHost> {
         let component = Component::from_file(&engine, path)?;
 
         let mut linker = Linker::new(&engine);
         Core::add_to_linker(&mut linker, |state: &mut PluginState| state)?;
 
-        let mut store = Store::new(&engine, PluginState { shell });
+        let mut store = Store::new(&engine, PluginState {});
         let bindings = Core::instantiate(&mut store, &component, &linker)?;
-
-        // dbg!(bindings.call_init(&mut store)?);
 
         Ok(PluginHost {
             component,
@@ -76,8 +70,8 @@ impl PluginHost {
     }
 
     #[track_caller]
-    pub fn new(engine: Engine, shell: Arc<Mutex<Shell>>, path: impl AsRef<Path>) -> PluginHost {
-        PluginHost::try_new(engine, shell, path).unwrap()
+    pub fn new(engine: Engine, path: impl AsRef<Path>) -> PluginHost {
+        PluginHost::try_new(engine, path).unwrap()
     }
 
     #[track_caller]

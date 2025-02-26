@@ -4,23 +4,26 @@
 // compile_error!("This crate must be compiled for the wasm32 target!");
 
 wit_bindgen::generate!(in "../wit/plugin.wit");
-use plugin_app::core::host_app::{define_cmd, log, Level};
+use plugin_app::core::{
+    host_app::{log, Level},
+    types::Command,
+};
 
 pub struct PluginIe;
 
 impl Guest for PluginIe {
     fn init() -> PluginInfo {
         log(Level::Debug, "Hello my friend!");
-        define_cmd(
-            "hello",
-            "hello <language>",
-            "Says hello in the given language",
-        );
 
         PluginInfo {
             name: env!("CARGO_PKG_NAME").to_string(),
             description: env!("CARGO_PKG_DESCRIPTION").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            commands: vec![Command {
+                name: "hello".to_string(),
+                usage: "hello <language>".to_string(),
+                description: "Says \"hello\" in the specified language, only french, english, italian and german are supported.".to_string()
+            }],
         }
     }
 

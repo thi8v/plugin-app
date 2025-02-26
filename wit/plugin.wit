@@ -1,11 +1,32 @@
 package plugin-app:core;
 
 interface types {
+  record command {
+    /// The name of the command, must fullfil the following requirements:
+    /// - not longer than 16 characters
+    /// - no whitespaces
+    /// - only alphanumeric characters
+    name: string,
+    /// The usage of the command.
+    ///
+    /// # Example
+    ///
+    /// help [cmd]
+    usage: string,
+    /// A useful message to the user that explains this command.
+    description: string,
+  }
+
   /// The informations the host expects to know after initialization.
   record plugin-info {
+    /// The name of your plugin, the requirements are the same as the command names.
     name: string,
+    /// A useful message of what the plugin is doing
     description: string,
+    /// The version of this plugin, it must follow the semantic versioning format
     version: string,
+    /// Commands defined by the plugin
+    commands: list<command>,
   }
 
   /// Log level
@@ -22,10 +43,6 @@ interface host-app {
 
   /// Log a msg with the given level to stdout
   log: func(lvl: level, msg: string);
-
-  /// Registers a new commands with the name, usage and description passed as
-  /// arguements
-  define-cmd: func(name: string, usage: string, description: string);
 }
 
 world core {

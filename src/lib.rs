@@ -6,139 +6,150 @@ use std::io::{stdin, stdout, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use anyhow::{bail, Result};
+use host::plugin_app::core::types::Command;
 use host::{PluginHost, PluginInfo};
-use wasmtime::*;
+use wasmtime::Engine;
 
+pub mod cmds;
 pub mod host;
 
-pub fn parse_cmd(cmd: &str) -> Vec<&str> {
-    cmd.split_whitespace().collect()
+#[derive(Debug, Clone)]
+pub struct Cmd {
+    usage: String,
+    description: String,
 }
 
-pub type NativeExec = fn(&mut ShellCtx, Vec<&str>) -> Result<(), ()>;
-
-pub enum CmdImpl {
-    Native(NativeExec),
-    Wasm { plugin_id: PluginId, cmd: String },
-}
-
-impl CmdImpl {
-    pub fn call(&self, ctx: &mut ShellCtx, cmd: &str, args: Vec<&str>) -> Result<(), ()> {
-        match self {
-            Self::Native(func) => (func)(ctx, args),
-            Self::Wasm { plugin_id, cmd } => todo!("IMPLEMENT THE WASM CALL"),
+impl Cmd {
+    pub fn new(usage: impl ToString, description: impl ToString) -> Cmd {
+        Cmd {
+            usage: usage.to_string(),
+            description: description.to_string(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PluginId(u32);
+type BuiltinFn = fn(&mut ExecutionCtx, &str, Vec<&str>) -> Result<(), ()>;
 
-pub struct Plugin {
-    pub info: PluginInfo,
-    pub host: PluginHost,
+#[derive(Debug, Clone)]
+pub enum Runner {
+    /// Built-in command.
+    Builtin(BuiltinFn),
+    Wasm {
+        /// The plugin where the command is defined
+        plugin: String,
+    },
 }
 
-#[derive(Clone)]
-pub struct ShellCtx {
-    cmd_descs: HashMap<String, Cmd>,
-    running: bool,
-    /// the id of the most recent plugin loaded
-    last_id: PluginId,
-    engine: Engine,
-    plugin_ids: HashMap<String, PluginId>,
-    plugins: HashMap<PluginId, Arc<Mutex<Plugin>>>,
-}
-
-impl Debug for ShellCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShellCtx")
-            .field("cmd_descs", &self.cmd_descs)
-            .field("running", &self.running)
-            .finish_non_exhaustive()
+impl Runner {
+    pub fn run(&self, ctx: &mut ExecutionCtx, cmd: &str, args: Vec<&str>) -> Result<(), ()> {
+        match self {
+            Runner::Builtin(func) => (func)(ctx, cmd, args),
+            Runner::Wasm { plugin } => {
+                // we can unwrap here because we know the plugin exists, and if
+                // it doesn't it's a bug in this app.
+                let mut host = ctx.hosts.get(plugin).unwrap().lock().unwrap();
+                let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+                host.call_run_command(cmd, &args);
+                Ok(())
+            }
+        }
     }
 }
 
+impl From<BuiltinFn> for Runner {
+    fn from(value: BuiltinFn) -> Self {
+        Runner::Builtin(value)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionCtx {
+    /// Maps a command name to its informations
+    cmds: HashMap<String, Cmd>,
+    /// Maps a plugin name to its informations
+    plugins: HashMap<String, PluginInfo>,
+    /// Maps a plugin name to its plugin host
+    hosts: HashMap<String, Arc<Mutex<PluginHost>>>,
+    /// Wasm engine
+    engine: Engine,
+    /// The commands to add after initialization of the plugin
+    new_cmds: Option<(String, Vec<Command>)>,
+    /// Is the shell running?
+    running: bool,
+}
+
+impl ExecutionCtx {
+    pub fn load_plugin(&mut self, path: PathBuf) {
+        let mut host = PluginHost::new(self.engine.clone(), path);
+        let info = host.call_init();
+
+        if self.hosts.contains_key(&info.name) {
+            println!("ERR: a plugin with the same name is already loaded")
+        }
+
+        self.hosts
+            .insert(info.name.clone(), Arc::new(Mutex::new(host)));
+        self.plugins.insert(info.name.clone(), info.clone());
+        self.new_cmds = Some((info.name, info.commands));
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Shell {
-    // cmd_execs: HashMap<String, BoxedExec<'a>>,
-    cmd_execs: HashMap<String, CmdImpl>,
-    ctx: ShellCtx,
+    /// Maps the command name to its runner
+    runners: HashMap<String, Runner>,
+    exec_ctx: ExecutionCtx,
 }
 
 impl Shell {
     pub fn new() -> Shell {
         let mut shell = Shell {
-            cmd_execs: HashMap::new(),
-            ctx: ShellCtx {
-                cmd_descs: HashMap::new(),
-                running: true,
-                last_id: PluginId(0),
-                engine: Engine::default(),
-                plugin_ids: HashMap::new(),
+            runners: HashMap::new(),
+            exec_ctx: ExecutionCtx {
+                cmds: HashMap::new(),
                 plugins: HashMap::new(),
+                hosts: HashMap::new(),
+                engine: Engine::default(),
+                new_cmds: None,
+                running: true,
             },
         };
 
-        shell.register_cmd(
+        shell.define_cmd(
             "quit",
-            Cmd {
-                usage: "quit".to_string(),
-                description: "Quit the app".to_string(),
-            },
-            |ctx, _| {
+            Cmd::new("quit", "Quit the shell."),
+            (|ctx, _, _| {
                 ctx.running = false;
                 Ok(())
-            },
+            }) as BuiltinFn,
         );
 
-        shell.register_cmd(
-            "load",
-            Cmd {
-                usage: "load <wasm file>".to_string(),
-                description: "Load, and initialize the plugin from the given file path".to_string(),
-            },
-            Cmd::load_exec,
-        );
-
-        shell.register_cmd(
+        shell.define_cmd(
             "help",
-            Cmd {
-                usage: "help".to_string(),
-                description: "Show all commands".to_string(),
-            },
-            Cmd::help_exec,
+            Cmd::new("help [cmd..]", "Print all commands to the screen or an helpful message if a command is passed as argument"),
+            cmds::help_exec as BuiltinFn
         );
 
-        shell.register_cmd(
-            "plugins",
-            Cmd {
-                usage: "plugins".to_string(),
-                description: "List all plugins loaded".to_string(),
-            },
-            Cmd::plugins_exec,
+        shell.define_cmd(
+            "list-plugins",
+            Cmd::new("list-plugins", "Print all the plugins currently loaded"),
+            cmds::list_plugin_exec as BuiltinFn,
+        );
+
+        shell.define_cmd(
+            "load",
+            Cmd::new("load <path>", "Loads a new plugin."),
+            cmds::load_exec as BuiltinFn,
         );
 
         shell
     }
 
-    pub fn register_cmd(&mut self, name: impl ToString, cmd: Cmd, exec: NativeExec) {
-        let name = name.to_string();
-
-        if name.len() >= 16
-            && !name.contains(char::is_whitespace)
-            && name.contains(char::is_alphanumeric)
-        {
-            panic!("{name:?} is not a correct command name, it must be 16 charcters or shorter, doesn't contain whitesapces and is alphanumeric")
-        }
-
-        self.cmd_execs.insert(name.clone(), CmdImpl::Native(exec));
-        self.ctx.cmd_descs.insert(name, cmd);
-    }
-
-    pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn run(&mut self) -> Result<()> {
         let mut input = String::new();
 
-        while self.ctx.running {
+        while self.exec_ctx.running {
             input.clear();
 
             print!(">> ");
@@ -149,102 +160,66 @@ impl Shell {
             // remove the last character, the newline it's useless.
             input.pop();
 
-            let args = parse_cmd(&input);
+            let args = Shell::parse_cmd(&input);
 
             if args.len() == 0 {
-                println!("ERR: unknown command {input:?}, type \"help\" to see all commands.");
                 continue;
             }
 
-            // TODO: change this let-else in a if xxx.is_some()
-            let Some(_) = self.get_cmd(args[0]).cloned() else {
-                println!("ERR: unknown command {input:?}, type \"help\" to see all commands.");
+            let Some(runner) = self.runners.get_mut(args[0]) else {
+                eprintln!(
+                    "ERR: unknown command {:?}, type \"help\" to see all commands.",
+                    args[0]
+                );
                 continue;
             };
-            let exec = self.cmd_execs.get(args[0]).unwrap();
 
-            match exec.call(&mut self.ctx, args[0], args[1..].to_vec()) {
+            match runner.run(&mut self.exec_ctx, args[0], args[1..].to_vec()) {
                 Ok(()) => {}
-                Err(_) => {
-                    // println!("ERR: command encountered errors:\n{e:?}");
-                    continue;
+                Err(()) => {
+                    println!("ERROR")
                 }
             }
+
+            self.handle_new_cmds();
         }
         Ok(())
     }
 
-    pub fn get_cmd(&self, name: &str) -> Option<&Cmd> {
-        self.ctx.cmd_descs.get(name)
-    }
+    pub fn define_cmd(&mut self, cmd_name: impl ToString, cmd: Cmd, runner: impl Into<Runner>) {
+        let name = cmd_name.to_string();
 
-    pub fn load_plugin(&mut self, path: PathBuf) -> Result<(), Box<dyn Error>> {
-        let mut host = PluginHost::new(
-            self.ctx.engine.clone(),
-            Arc::new(Mutex::new(self.clone())),
-            path,
-        );
-        let info = host.call_init();
-
-        self.ctx.last_id.0 += 1;
-        let id = self.ctx.last_id.clone();
-
-        assert!(!self.ctx.plugin_ids.contains_key(&info.name));
-        self.ctx.plugin_ids.insert(info.name.clone(), id.clone());
-
-        self.ctx
-            .plugins
-            .insert(id, Arc::new(Mutex::new(Plugin { info, host })));
-
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Cmd {
-    /// Usage of the command
-    usage: String,
-    // aliases: Vec<String>, // TODO: add later
-    description: String,
-}
-
-impl Cmd {
-    pub fn help_exec(ctx: &mut ShellCtx, _: Vec<&str>) -> Result<(), ()> {
-        println!("All commands:");
-        let mut cmds = ctx.cmd_descs.iter().map(|(_, cmd)| cmd).collect::<Vec<_>>();
-        cmds.sort_by(|a, b| a.usage.cmp(&b.usage));
-        for cmd in cmds {
-            println!(" {:16} - {}", cmd.usage, cmd.description);
-        }
-        Ok(())
-    }
-
-    pub fn plugins_exec(ctx: &mut ShellCtx, _: Vec<&str>) -> Result<(), ()> {
-        let plugins = &ctx.plugins;
-        if plugins.is_empty() {
-            println!("There is currently no plugins loaded!");
-            return Ok(());
+        if name.len() >= 16
+            && !name.contains(char::is_whitespace)
+            && name.contains(char::is_alphanumeric)
+        {
+            panic!("{name:?} is not a correct command name, it must be 16 charcters or shorter, doesn't contain whitesapces and is alphanumeric")
         }
 
-        println!("All loaded plugins:");
-        for (id, plugin) in &ctx.plugins {
-            let info = &plugin.lock().unwrap().info;
+        self.exec_ctx.cmds.insert(name.clone(), cmd);
+        self.runners.insert(name.clone(), runner.into());
+    }
 
-            println!(
-                "  {:20} - {}",
-                format!("{}({})", info.name, id.0),
-                info.description
+    pub fn handle_new_cmds(&mut self) {
+        if self.exec_ctx.new_cmds.is_none() {
+            return;
+        }
+
+        let (plugin_name, commands) = self.exec_ctx.new_cmds.clone().unwrap();
+
+        for command in commands {
+            self.define_cmd(
+                command.name,
+                Cmd::new(command.usage, command.description),
+                Runner::Wasm {
+                    plugin: plugin_name.clone(),
+                },
             );
         }
-        Ok(())
+        self.exec_ctx.new_cmds = None;
     }
 
-    pub fn load_exec(ctx: &mut ShellCtx, args: Vec<&str>) -> Result<(), ()> {
-        let Some(path) = args.get(0).map(|s| PathBuf::from(s)) else {
-            println!("ERR: you must give the path to a WASM file to load.");
-            return Err(());
-        };
-        ctx.load_plugin(path).unwrap();
-        Ok(())
+    pub fn parse_cmd(cmd: &str) -> Vec<&str> {
+        cmd.split_whitespace().collect()
     }
 }
