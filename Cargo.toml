@@ -1,3 +1,8 @@
+[workspace]
+members = [
+  "plugin-ie",
+]
+
 [package]
 name = "plugin-app"
 version = "0.1.0"

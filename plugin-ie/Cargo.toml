@@ -1,0 +1,11 @@
+[package]
+name = "plugin-ie"
+version = "0.1.0"
+description = "A simple plugin for demonstration purposes."
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.39.0"

@@ -1,0 +1,42 @@
+package plugin-app:core;
+
+interface types {
+  /// The informations the host expects to know after initialization.
+  record plugin-info {
+    name: string,
+    description: string,
+    version: string,
+  }
+
+  /// Log level
+  enum level {
+    debug,
+    info,
+    warn,
+    error,
+  }
+}
+
+interface host-app {
+  use types.{level};
+
+  /// Log a msg with the given level to stdout
+  log: func(lvl: level, msg: string);
+
+  /// Registers a new commands with the name, usage and description passed as
+  /// arguements
+  define-cmd: func(name: string, usage: string, description: string);
+}
+
+world core {
+  import host-app;
+
+  use types.{plugin-info};
+
+  /// Initilialize the plugin, and returns a plugin-info
+  export init: func() -> plugin-info;
+
+  // TODO: return a Result<(), ()>
+  /// Run a command defined by this plugin with the given name and arguments
+  export run-command: func(name: string, args: list<string>);
+}

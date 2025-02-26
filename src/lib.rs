@@ -6,51 +6,27 @@ use std::io::{stdin, stdout, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use component::TypedFunc;
+use host::{PluginHost, PluginInfo};
 use wasmtime::*;
+
+pub mod host;
 
 pub fn parse_cmd(cmd: &str) -> Vec<&str> {
     cmd.split_whitespace().collect()
 }
 
-pub trait ExecFn<'a>: Fn(&mut ShellCtx, Vec<&str>) -> Result<(), ()> + 'a {}
-// generic implementation to use it with ease
-impl<'a, F> ExecFn<'a> for F where F: Fn(&mut ShellCtx, Vec<&str>) -> Result<(), ()> + 'a {}
+pub type NativeExec = fn(&mut ShellCtx, Vec<&str>) -> Result<(), ()>;
 
-pub type BoxedExec<'a> = Box<dyn ExecFn<'a>>;
-
-pub struct WasmEnv<T> {
-    engine: Engine,
-    linker: Linker<T>,
-    plugins: HashMap<PluginId, Plugin>,
+pub enum CmdImpl {
+    Native(NativeExec),
+    Wasm { plugin_id: PluginId, cmd: String },
 }
 
-impl<T> WasmEnv<T> {
-    pub fn new(data: T) -> WasmEnv<T> {
-        let engine = Engine::default();
-        let mut linker = Linker::new(&engine);
-        linker
-            .func_wrap(
-                "plugin-app",
-                "print",
-                |mut caller: Caller<'_, T>, ptr: i32, len: i32| {
-                    let mem = caller
-                        .get_export("memory")
-                        .and_then(|e| e.into_memory())
-                        .expect("Memory not found!");
-                    let data = mem.data(&caller);
-                    let start = ptr as usize;
-                    let end = start + len as usize;
-                    let msg = String::from_utf8_lossy(&data[start..end]);
-                    println!("{msg}");
-                },
-            )
-            .unwrap();
-
-        WasmEnv {
-            engine,
-            linker,
-            plugins: HashMap::new(),
+impl CmdImpl {
+    pub fn call(&self, ctx: &mut ShellCtx, cmd: &str, args: Vec<&str>) -> Result<(), ()> {
+        match self {
+            Self::Native(func) => (func)(ctx, args),
+            Self::Wasm { plugin_id, cmd } => todo!("IMPLEMENT THE WASM CALL"),
         }
     }
 }
@@ -58,17 +34,9 @@ impl<T> WasmEnv<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PluginId(u32);
 
-#[derive(Debug)]
 pub struct Plugin {
-    /// Name of the plugin, it must be unique to each plugin.
-    name: String,
-    /// Description of the plugin
-    desc: String,
-    /// Version of the plugin
-    version: String,
-    store: Store<()>,
-    instance: Instance,
-    module: Module,
+    pub info: PluginInfo,
+    pub host: PluginHost,
 }
 
 #[derive(Clone)]
@@ -77,60 +45,9 @@ pub struct ShellCtx {
     running: bool,
     /// the id of the most recent plugin loaded
     last_id: PluginId,
+    engine: Engine,
     plugin_ids: HashMap<String, PluginId>,
-    wasm: Arc<Mutex<WasmEnv<()>>>,
-}
-
-impl ShellCtx {
-    pub fn load_plugin(&mut self, path: PathBuf) -> Result<(), Box<dyn Error>> {
-        let _wasm = self.wasm.clone();
-        let mut wasm = _wasm.lock().unwrap();
-
-        let module = Module::from_file(&wasm.engine, path)?;
-
-        let mut store = Store::new(&wasm.engine, ());
-
-        let instance = wasm.linker.instantiate(&mut store, &module)?;
-
-        for export in instance.exports(&mut store) {
-            println!("{}: {:?}", export.name(), export.into_extern());
-        }
-        println!();
-        let table = instance
-            .get_table(&mut store, "__indirect_function_table")
-            .expect("Function table not found");
-
-        let init_fn = instance.get_typed_func::<(), i32>(&mut store, "init")?;
-
-        let res = init_fn.call(&mut store, ())?;
-        let func = table.get(&mut store, res as u64).unwrap();
-        let res2 = func
-            .unwrap_func()
-            .unwrap()
-            .typed::<(), ()>(&mut store)
-            .unwrap();
-        res2.call(&mut store, ())?;
-
-        let plugin = Plugin {
-            // TODO: initialize the name, desc and version of the plugin
-            name: String::new(),
-            desc: String::new(),
-            version: String::new(),
-            store,
-            instance,
-            module,
-        };
-
-        self.last_id.0 += 1;
-        let id = self.last_id.clone();
-
-        assert!(!self.plugin_ids.contains_key(&plugin.name));
-        self.plugin_ids.insert(plugin.name.clone(), id.clone());
-
-        wasm.plugins.insert(id, plugin);
-
-        Ok(())
-    }
+    plugins: HashMap<PluginId, Arc<Mutex<Plugin>>>,
 }
 
 impl Debug for ShellCtx {
@@ -142,21 +59,23 @@ impl Debug for ShellCtx {
     }
 }
 
-pub struct Shell<'a> {
-    cmd_execs: HashMap<String, BoxedExec<'a>>,
+pub struct Shell {
+    // cmd_execs: HashMap<String, BoxedExec<'a>>,
+    cmd_execs: HashMap<String, CmdImpl>,
     ctx: ShellCtx,
 }
 
-impl<'a> Shell<'a> {
-    pub fn new() -> Shell<'a> {
+impl Shell {
+    pub fn new() -> Shell {
         let mut shell = Shell {
             cmd_execs: HashMap::new(),
             ctx: ShellCtx {
                 cmd_descs: HashMap::new(),
                 running: true,
                 last_id: PluginId(0),
+                engine: Engine::default(),
                 plugin_ids: HashMap::new(),
-                wasm: Arc::new(Mutex::new(WasmEnv::new(()))),
+                plugins: HashMap::new(),
             },
         };
 
@@ -202,12 +121,17 @@ impl<'a> Shell<'a> {
         shell
     }
 
-    pub fn register_cmd(&mut self, name: impl ToString, cmd: Cmd, exec: impl ExecFn<'a>) {
+    pub fn register_cmd(&mut self, name: impl ToString, cmd: Cmd, exec: NativeExec) {
         let name = name.to_string();
-        if name.len() > 16 {
-            todo!("MAYBE TOO LONG ?? IDK")
+
+        if name.len() >= 16
+            && !name.contains(char::is_whitespace)
+            && name.contains(char::is_alphanumeric)
+        {
+            panic!("{name:?} is not a correct command name, it must be 16 charcters or shorter, doesn't contain whitesapces and is alphanumeric")
         }
-        self.cmd_execs.insert(name.clone(), Box::new(exec));
+
+        self.cmd_execs.insert(name.clone(), CmdImpl::Native(exec));
         self.ctx.cmd_descs.insert(name, cmd);
     }
 
@@ -239,7 +163,7 @@ impl<'a> Shell<'a> {
             };
             let exec = self.cmd_execs.get(args[0]).unwrap();
 
-            match (exec)(&mut self.ctx, args[1..].to_vec()) {
+            match exec.call(&mut self.ctx, args[0], args[1..].to_vec()) {
                 Ok(()) => {}
                 Err(_) => {
                     // println!("ERR: command encountered errors:\n{e:?}");
@@ -252,6 +176,27 @@ impl<'a> Shell<'a> {
 
     pub fn get_cmd(&self, name: &str) -> Option<&Cmd> {
         self.ctx.cmd_descs.get(name)
+    }
+
+    pub fn load_plugin(&mut self, path: PathBuf) -> Result<(), Box<dyn Error>> {
+        let mut host = PluginHost::new(
+            self.ctx.engine.clone(),
+            Arc::new(Mutex::new(self.clone())),
+            path,
+        );
+        let info = host.call_init();
+
+        self.ctx.last_id.0 += 1;
+        let id = self.ctx.last_id.clone();
+
+        assert!(!self.ctx.plugin_ids.contains_key(&info.name));
+        self.ctx.plugin_ids.insert(info.name.clone(), id.clone());
+
+        self.ctx
+            .plugins
+            .insert(id, Arc::new(Mutex::new(Plugin { info, host })));
+
+        Ok(())
     }
 }
 
@@ -275,20 +220,20 @@ impl Cmd {
     }
 
     pub fn plugins_exec(ctx: &mut ShellCtx, _: Vec<&str>) -> Result<(), ()> {
-        let _wasm = ctx.wasm.clone();
-        let wasm = _wasm.lock().unwrap();
-        let mut cmds = wasm.plugins.iter().collect::<Vec<_>>();
-        if cmds.is_empty() {
-            println!("There is currently no plugin loaded!");
+        let plugins = &ctx.plugins;
+        if plugins.is_empty() {
+            println!("There is currently no plugins loaded!");
             return Ok(());
         }
+
         println!("All loaded plugins:");
-        cmds.sort_by(|a, b| a.1.name.cmp(&b.1.name));
-        for (id, plugin) in cmds {
+        for (id, plugin) in &ctx.plugins {
+            let info = &plugin.lock().unwrap().info;
+
             println!(
-                " {:16} - {}",
-                format!("{}({})", plugin.name, id.0),
-                plugin.desc
+                "  {:20} - {}",
+                format!("{}({})", info.name, id.0),
+                info.description
             );
         }
         Ok(())

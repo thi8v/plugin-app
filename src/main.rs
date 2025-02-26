@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use plugin_app::Shell;
+use plugin_app::{host::PluginHost, Shell};
 
 pub const WELCOME_MSG: &str = r#"Welcome to this app, in this app you can load and unload plugins at runtime.
 Type "help" to get some help."#;
@@ -9,5 +9,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("{WELCOME_MSG}");
     let mut shell = Shell::new();
     shell.run()?;
+
+    // println!();
+    // let engine = wasmtime::Engine::default();
+    // let mut host = PluginHost::try_new(engine.clone(), "plugin_ie.wasm")?;
+    // dbg!(host.call_init());
+    // host.call_run_command("hello", &["french".to_string()]);
     Ok(())
 }
