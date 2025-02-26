@@ -8,7 +8,7 @@ components. They are then executed at runtime by the app.
 
 To run this example you need various softwares:
 - Rust (no way?) and Cargo
-- [Wasm-tools][https://github.com/bytecodealliance/wasm-tools/]
+- [Wasm-tools](https://github.com/bytecodealliance/wasm-tools/)
 
 # How to use it
 
